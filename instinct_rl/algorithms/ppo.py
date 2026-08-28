@@ -28,6 +28,7 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 from collections import defaultdict
+import importlib
 
 import torch
 import torch.distributed as dist
@@ -37,6 +38,13 @@ import torch.optim as optim
 from instinct_rl.modules import ActorCritic
 from instinct_rl.storage import RolloutStorage
 from instinct_rl.utils.utils import get_subobs_size
+
+
+def _resolve_callable(func):
+    if not isinstance(func, str):
+        return func
+    module_name, function_name = func.split(":", 1)
+    return getattr(importlib.import_module(module_name), function_name)
 
 
 class PPO:
@@ -61,6 +69,7 @@ class PPO:
         schedule="fixed",
         desired_kl=0.01,
         auxiliary_reward_per_env_reward_coefs: list[float] = list(),
+        symmetry_cfg: dict | None = None,
         device="cpu",
         **kwargs,
     ):
@@ -87,6 +96,24 @@ class PPO:
         self.actor_critic.to(self.device)
         self.storage = None  # initialized later
         self.optimizer = getattr(optim, optimizer_class_name)(self.actor_critic.parameters(), lr=learning_rate)
+
+        if symmetry_cfg is not None:
+            use_symmetry = symmetry_cfg["use_data_augmentation"] or symmetry_cfg["use_mirror_loss"]
+            if not use_symmetry:
+                print("Symmetry not used for learning. We will use it for logging instead.")
+            symmetry_cfg["data_augmentation_func"] = _resolve_callable(symmetry_cfg["data_augmentation_func"])
+            if not callable(symmetry_cfg["data_augmentation_func"]):
+                raise ValueError(
+                    "Symmetry configuration exists but the data augmentation function is not callable: "
+                    f"{symmetry_cfg['data_augmentation_func']}"
+                )
+            if self.actor_critic.is_recurrent:
+                raise ValueError("Symmetry augmentation is not supported for recurrent policies.")
+            self.symmetry = symmetry_cfg
+            self.symmetry_loss_coef = symmetry_cfg["mirror_loss_coeff"] if symmetry_cfg["use_mirror_loss"] else 0.0
+        else:
+            self.symmetry = None
+            self.symmetry_loss_coef = 0.0
 
         # PPO parameters
         self.clip_param = clip_param
@@ -219,16 +246,48 @@ class PPO:
 
     def compute_losses(self, minibatch):
         actor_hidden_states = minibatch.hidden_states.actor if self.actor_critic.is_recurrent else None
-        self.actor_critic.act(minibatch.obs, masks=minibatch.masks, hidden_states=actor_hidden_states)
-        actions_log_prob_batch = self.actor_critic.get_actions_log_prob(minibatch.actions)
+        original_batch_size = minibatch.obs.shape[0]
+        num_aug = 1
+        obs_batch = minibatch.obs
+        critic_obs_batch = minibatch.critic_obs
+        actions_batch = minibatch.actions
+        old_actions_log_prob_batch = minibatch.old_actions_log_prob
+        target_values_batch = minibatch.values
+        advantages_batch = minibatch.advantages
+        returns_batch = minibatch.returns
+        old_mu_batch = minibatch.old_mu
+        old_sigma_batch = minibatch.old_sigma
+
+        if self.symmetry and self.symmetry["use_data_augmentation"]:
+            data_augmentation_func = self.symmetry["data_augmentation_func"]
+            obs_batch, actions_batch = data_augmentation_func(
+                env=self.symmetry["_env"],
+                obs=obs_batch,
+                actions=actions_batch,
+                obs_type="policy",
+            )
+            critic_obs_batch, _ = data_augmentation_func(
+                env=self.symmetry["_env"],
+                obs=critic_obs_batch,
+                actions=None,
+                obs_type="critic",
+            )
+            num_aug = int(obs_batch.shape[0] / original_batch_size)
+            old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(num_aug, 1)
+            target_values_batch = target_values_batch.repeat(num_aug, 1)
+            advantages_batch = advantages_batch.repeat(num_aug, 1)
+            returns_batch = returns_batch.repeat(num_aug, 1)
+
+        self.actor_critic.act(obs_batch, masks=minibatch.masks, hidden_states=actor_hidden_states)
+        actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
         critic_hidden_states = minibatch.hidden_states.critic if self.actor_critic.is_recurrent else None
         value_batch = self.actor_critic.evaluate(
-            minibatch.critic_obs, masks=minibatch.masks, hidden_states=critic_hidden_states
+            critic_obs_batch, masks=minibatch.masks, hidden_states=critic_hidden_states
         )
-        mu_batch = self.actor_critic.action_mean
-        sigma_batch = self.actor_critic.action_std
+        mu_batch = self.actor_critic.action_mean[:original_batch_size]
+        sigma_batch = self.actor_critic.action_std[:original_batch_size]
         try:
-            entropy_batch = self.actor_critic.entropy
+            entropy_batch = self.actor_critic.entropy[:original_batch_size]
         except:
             entropy_batch = None
 
@@ -236,8 +295,8 @@ class PPO:
         if self.desired_kl != None and self.schedule == "adaptive":
             with torch.inference_mode():
                 kl = torch.sum(
-                    torch.log(sigma_batch / minibatch.old_sigma + 1.0e-5)
-                    + (torch.square(minibatch.old_sigma) + torch.square(minibatch.old_mu - mu_batch))
+                    torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
+                    + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
                     / (2.0 * torch.square(sigma_batch))
                     - 0.5,
                     axis=-1,
@@ -263,28 +322,30 @@ class PPO:
                     param_group["lr"] = self.learning_rate
 
         # Surrogate loss
-        ratio = torch.exp(actions_log_prob_batch - torch.squeeze(minibatch.old_actions_log_prob))
-        mixed_advantages = torch.mean(minibatch.advantages * self.advantage_mixing_weights, dim=-1)
+        ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+        mixed_advantages = torch.mean(advantages_batch * self.advantage_mixing_weights, dim=-1)
         surrogate = -mixed_advantages * ratio
         surrogate_clipped = -mixed_advantages * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
         surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
         # Value function loss
         if self.use_clipped_value_loss:
-            value_clipped = minibatch.values + (value_batch - minibatch.values).clamp(-self.clip_param, self.clip_param)
-            value_losses = (value_batch - minibatch.returns).pow(2)
-            value_losses_clipped = (value_clipped - minibatch.returns).pow(2)
+            value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                -self.clip_param, self.clip_param
+            )
+            value_losses = (value_batch - returns_batch).pow(2)
+            value_losses_clipped = (value_clipped - returns_batch).pow(2)
             value_loss = torch.max(value_losses, value_losses_clipped)
         else:
-            value_loss = (minibatch.returns - value_batch).pow(2)
+            value_loss = (returns_batch - value_batch).pow(2)
         # preserve the last dimension for multi-reward setting
         value_loss = value_loss.reshape(-1, value_loss.shape[-1]).mean(dim=0)
 
         # pack the losses and stats
         stats_ = dict()
         if value_loss.numel() > 1:
-            for i in range(minibatch.advantages.shape[-1]):
-                stats_[f"advantage_{i}"] = minibatch.advantages[..., i].detach().mean()
+            for i in range(advantages_batch.shape[-1]):
+                stats_[f"advantage_{i}"] = advantages_batch[..., i].detach().mean()
             for i in range(value_loss.numel()):
                 stats_[f"value_loss_{i}"] = value_loss.detach().cpu()[i]
 
@@ -294,6 +355,32 @@ class PPO:
         )
         if entropy_batch is not None:
             return_["entropy"] = -entropy_batch.mean()
+
+        if self.symmetry:
+            if not self.symmetry["use_data_augmentation"]:
+                data_augmentation_func = self.symmetry["data_augmentation_func"]
+                obs_batch, _ = data_augmentation_func(
+                    env=self.symmetry["_env"],
+                    obs=obs_batch,
+                    actions=None,
+                    obs_type="policy",
+                )
+                num_aug = int(obs_batch.shape[0] / original_batch_size)
+
+            mean_actions_batch = self.actor_critic.act_inference(obs_batch.detach().clone())
+            action_mean_orig = mean_actions_batch[:original_batch_size]
+            _, actions_mean_symm_batch = data_augmentation_func(
+                env=self.symmetry["_env"],
+                obs=None,
+                actions=action_mean_orig,
+                obs_type="policy",
+            )
+            symmetry_loss = nn.MSELoss()(
+                mean_actions_batch[original_batch_size:],
+                actions_mean_symm_batch.detach()[original_batch_size:],
+            )
+            return_["symmetry_loss"] = symmetry_loss
+            stats_["symmetry_loss"] = symmetry_loss.detach()
 
         inter_vars = dict(
             ratio=ratio,

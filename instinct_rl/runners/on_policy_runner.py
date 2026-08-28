@@ -71,6 +71,8 @@ class OnPolicyRunner:
 
         alg_class_name = self.alg_cfg.pop("class_name")
         alg_class = importlib.import_module() if ":" in alg_class_name else getattr(algorithms, alg_class_name)
+        if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
+            self.alg_cfg["symmetry_cfg"]["_env"] = env
         self.alg: algorithms.PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
