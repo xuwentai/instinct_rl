@@ -21,6 +21,7 @@ class EncoderActorCriticMixin:
         num_actions,
         encoder_configs: Dict[str, dict],
         critic_encoder_configs=None,  # None, "shared", or an ordereddict of configs (in the same order as encoder_configs)
+        share_actor_encoder_for_critic: bool = False,
         **kwargs,
     ):
         """NOTE: recurrent encoder is not implemented and tested yet.
@@ -34,6 +35,7 @@ class EncoderActorCriticMixin:
 
         self.encoder_configs = copy(encoder_configs)
         self.critic_encoder_configs = copy(critic_encoder_configs)
+        self.share_actor_encoder_for_critic = share_actor_encoder_for_critic
         encoder_class_name = encoder_configs.pop("class_name", "ParallelLayer")
         EncoderClass = (
             getattr(importlib.import_module(encoder_class_name.split(":")[0]), encoder_class_name.split(":")[1])
@@ -62,6 +64,13 @@ class EncoderActorCriticMixin:
                 input_segments=self.__critic_obs_segments,
                 block_configs=self.critic_encoder_configs,
             )
+            if self.share_actor_encoder_for_critic:
+                if not hasattr(critic_encoders, "share_terrain_encoder_with"):
+                    raise ValueError(
+                        "share_actor_encoder_for_critic=True requires an encoder with "
+                        "share_terrain_encoder_with()."
+                    )
+                critic_encoders.share_terrain_encoder_with(encoders)
 
         embedded_obs_format = deepcopy(obs_format)
         embedded_obs_format["policy"] = encoders.output_segment

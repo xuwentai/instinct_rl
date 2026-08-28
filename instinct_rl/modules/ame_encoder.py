@@ -35,6 +35,8 @@ class AMEEncoder(nn.Module):
         self.attach_global = cfg.pop("attach_global", False)
         self.add_xy = cfg.pop("add_xy", False)
         self.image_layout = cfg.pop("image_layout", "auto")
+        self.query_latest_proprio = cfg.pop("query_latest_proprio", False)
+        self.proprio_history_length = cfg.pop("proprio_history_length", 1)
         nonlinearity = cfg.pop("nonlinearity", "ReLU")
         normlayer = cfg.pop("normlayer", "BatchNorm2d")
         global_hidden_sizes = cfg.pop("global_hidden_sizes", [256, 128])
@@ -53,6 +55,7 @@ class AMEEncoder(nn.Module):
         self.proprio_dim = get_subobs_size(self.input_segments, self.proprio_component_names)
         if self.proprio_dim <= 0:
             raise ValueError("AMEEncoder requires at least one non-map observation component for the attention query.")
+        self.query_proprio_dim = self._query_dim(self.proprio_dim)
 
         if isinstance(nonlinearity, str):
             nonlinearity = getattr(nn, nonlinearity)
@@ -79,7 +82,7 @@ class AMEEncoder(nn.Module):
                 normlayer(self.cnn_output_dim),
             )
 
-        self.proprio_embedding = nn.Linear(self.proprio_dim, self.mha_dim)
+        self.proprio_embedding = nn.Linear(self.query_proprio_dim, self.mha_dim)
         self.mha = nn.MultiheadAttention(embed_dim=self.mha_dim, num_heads=self.num_heads, batch_first=True)
 
         latent_dim = self.mha_dim
@@ -100,6 +103,33 @@ class AMEEncoder(nn.Module):
             nn.Identity() if latent_dim == self.output_size else nn.Linear(latent_dim, self.output_size)
         )
         self.build_output_segment()
+
+    def _query_dim(self, proprio_dim: int) -> int:
+        if not self.query_latest_proprio:
+            return proprio_dim
+        if self.proprio_history_length < 1 or proprio_dim % self.proprio_history_length != 0:
+            raise ValueError(
+                "Cannot split latest proprio frame: "
+                f"proprio_dim={proprio_dim}, proprio_history_length={self.proprio_history_length}"
+            )
+        return proprio_dim // self.proprio_history_length
+
+    def _query_proprio(self, proprio_obs: torch.Tensor) -> torch.Tensor:
+        if not self.query_latest_proprio:
+            return proprio_obs
+        return proprio_obs[:, -self.query_proprio_dim :]
+
+    def share_terrain_encoder_with(self, other: "AMEEncoder") -> None:
+        """Share map encoder modules and BN statistics with another AME encoder."""
+        if self.map_shape != other.map_shape:
+            raise ValueError(f"Cannot share AME terrain encoder with different map shapes: {self.map_shape} vs {other.map_shape}")
+        if self.map_channels != other.map_channels or self.add_xy != other.add_xy:
+            raise ValueError("Cannot share AME terrain encoder with different channel configuration.")
+        self.map_cnn = other.map_cnn
+        self.mha = other.mha
+        self.global_encoder = other.global_encoder
+        self.query_projector = other.query_projector
+        self.output_projection = other.output_projection
 
     def build_output_segment(self):
         self.output_segment = OrderedDict(
@@ -168,7 +198,7 @@ class AMEEncoder(nn.Module):
         cnn_features = self.map_cnn(image)
         local_features = cnn_features.flatten(2).transpose(1, 2)
 
-        proprio_embedding = self.proprio_embedding(proprio_obs)
+        proprio_embedding = self.proprio_embedding(self._query_proprio(proprio_obs))
         if self.attach_global:
             global_features = self.global_encoder(local_features)
             global_features_max, _ = torch.max(global_features, dim=1)
@@ -201,7 +231,7 @@ class AMEEncoder(nn.Module):
     def __str__(self):
         return (
             f"AMEEncoder(map={self.map_component_name}, map_shape={self.map_shape}, "
-            f"latent={self.output_size}, add_xy={self.add_xy})"
+            f"latent={self.output_size}, query_latest_proprio={self.query_latest_proprio}, add_xy={self.add_xy})"
         )
 
     def export_as_onnx(self, flat_input, filedir: str, *args, **kwargs):
