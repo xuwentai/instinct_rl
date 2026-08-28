@@ -242,7 +242,7 @@ class WasabiAlgoMixin:
             inputs=latent,
             grad_outputs=ones,
             create_graph=True,
-            retain_graph=True,
+            retain_graph=False,
             only_inputs=True,
         )[0]
 
@@ -273,7 +273,7 @@ class WasabiAlgoMixin:
             inputs=combined_states,
             grad_outputs=ones,
             create_graph=True,
-            retain_graph=True,
+            retain_graph=False,
             only_inputs=True,
         )[0]
 
@@ -297,7 +297,7 @@ class WasabiAlgoMixin:
             print("[Warning] The discriminator_optimizer state_dict is not found in the checkpoint")
 
     def wasabi_gradient_step(self, loss: torch.Tensor, average_stats: dict):
-        self.discriminator_optimizer.zero_grad()
+        self.discriminator_optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if dist.is_initialized():
             world_size = dist.get_world_size()

@@ -356,9 +356,11 @@ class PPO:
         if entropy_batch is not None:
             return_["entropy"] = -entropy_batch.mean()
 
-        if self.symmetry:
-            if not self.symmetry["use_data_augmentation"]:
-                data_augmentation_func = self.symmetry["data_augmentation_func"]
+        if self.symmetry and self.symmetry["use_mirror_loss"]:
+            data_augmentation_func = self.symmetry["data_augmentation_func"]
+            if self.symmetry["use_data_augmentation"]:
+                mean_actions_batch = self.actor_critic.action_mean
+            else:
                 obs_batch, _ = data_augmentation_func(
                     env=self.symmetry["_env"],
                     obs=obs_batch,
@@ -366,8 +368,8 @@ class PPO:
                     obs_type="policy",
                 )
                 num_aug = int(obs_batch.shape[0] / original_batch_size)
+                mean_actions_batch = self.actor_critic.act_inference(obs_batch)
 
-            mean_actions_batch = self.actor_critic.act_inference(obs_batch.detach().clone())
             action_mean_orig = mean_actions_batch[:original_batch_size]
             _, actions_mean_symm_batch = data_augmentation_func(
                 env=self.symmetry["_env"],
@@ -430,7 +432,7 @@ class PPO:
         NOTE: if the parameters are not on self.actor_critic, this function will not work. Please update other
         networks in another optimizer.
         """
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if dist.is_initialized():
             world_size = dist.get_world_size()
@@ -441,3 +443,4 @@ class PPO:
         grad_norm = nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
         average_stats["grad_norm"] = average_stats["grad_norm"] + grad_norm.detach()
         self.optimizer.step()
+        self.actor_critic.distribution = None
